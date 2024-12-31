@@ -32,6 +32,8 @@ class ESPImage:
     def __init__(self, data):
         self._data = data
         self._checksum = 0xEF
+        self._code_begin = None
+        self._code_end = None
         self._parse_header()
 
     # wrappers
@@ -55,12 +57,10 @@ class ESPImage:
 
     # parsers
     def _parse_header(self):
-        data = self._data
-
-        magic = data.read(1)[0]
+        magic = self.read(1)[0]
 
         if magic in (ESP_IMAGE_MAGIC, ESP_IMAGE_V2_MAGIC):
-            data.seek(-1, SEEK_CUR)
+            self.seek(-1, SEEK_CUR)
             return self._parse_ota()
 
         elif magic == 0xFF:
@@ -71,11 +71,9 @@ class ESPImage:
             return None
 
     def _parse_factory(self):
-        data = self._data
-
         # look for a partition table
-        data.seek(0x8000, SEEK_SET)
-        ptable = data.read(0x0C00)
+        self.seek(0x8000, SEEK_SET)
+        ptable = self.read(0x0C00)
         for entry in map(lambda p: ptable[p:p+32], range(0, len(ptable), 32)):
             # parse entry
             pmagic, ptype, psubtype, poff, psz, pname = unpack('<HBBII16s4x', entry)
@@ -90,38 +88,35 @@ class ESPImage:
                     psubtype = f'{psubtype}'
 
                 if ptype == 'app' and psubtype == 'ota_0':
-                    data.seek(poff)
-                    return self._parse_ota(data)
+                    self.seek(poff)
+                    return self._parse_ota()
             else:
                 print(f'[!] Could not find application!')
                 return None
 
     def _parse_ota(self):
-        data = self._data
-
-        code_begin = data.tell()
+        self._code_begin = self.tell()
 
         # magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
         # https://docs.espressif.com/projects/esptool/en/latest/esp8266/advanced-topics/firmware-image-format.html
-        common_header = data.read(8)
+        common_header = self.read(8)
         magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
 
         # ESP32 firmware images have a larger header, which we detect with heurstics
         # https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/firmware-image-format.html
-        extended_header = data.read(16)
+        extended_header = self.read(16)
         if extended_header[0] == 0:
-            data.seek(-16, SEEK_CUR)
+            self.seek(-16, SEEK_CUR)
 
         # walk through the segments
         for n in range(n_segments):
-            self._parse_segment()
+            self._parse_segment(n)
 
-    def _parse_segment(self):
-        data = self._data
-
-        segment_header = data.read(8)
+    def _parse_segment(self, n):
+        segment_header = self.read(8)
         mem_offset, segment_size = unpack('<II', segment_header)
-        print(f'[*] segment {n:2} 0x{segment_size:06X}:0x{data.tell():06X} @ 0x{mem_offset:08X}')
+        print(f'[*] segment {n:2} 0x{segment_size:06X}:0x{self.tell():06X} @ 0x{mem_offset:08X}')
+        self.seek(segment_size, SEEK_CUR)
         #segment = data.read(segment_size)
         #for x in segment: self._checksum ^= x
 
@@ -133,81 +128,6 @@ def _read_as_bytesio(path):
     else:
         with open(path, 'rb') as f:
             return io.BytesIO(f.read())
-
-def _process_data(data):
-    magic = data.read(1)[0]
-
-    if magic in (ESP_IMAGE_MAGIC, ESP_IMAGE_V2_MAGIC):
-        data.seek(-1, SEEK_CUR)
-        code_begin = data.tell()
-
-        # magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
-        # https://docs.espressif.com/projects/esptool/en/latest/esp8266/advanced-topics/firmware-image-format.html
-        common_header = data.read(8)
-        magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
-
-        # https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/firmware-image-format.html
-        extended_header = data.read(16)
-        if extended_header[0] == 0:
-            data.seek(-16, SEEK_CUR)
-
-        c = 0xEF
-        # walk through the segments
-        for n in range(n_segments):
-            chunk = data.read(8)
-            mem_offset, segment_size = unpack('<II', chunk)
-            print(f'segment {n:2} 0x{segment_size:06X}:0x{data.tell():06X} @ 0x{mem_offset:08X}')
-            segment = data.read(segment_size)
-            for x in segment:
-                c ^= x
-
-        data.seek(15 - (data.tell() % 16), SEEK_CUR)
-        print('checksum', hex(data.read(1)[0]), hex(c))
-        code_end = data.tell()
-        maybe_hash = data.read(32)
-        if len(maybe_hash) == 32:
-            data.seek(code_begin)
-            check_hash = sha256(data.read(code_end - code_begin)).digest()
-            if check_hash == maybe_hash:
-                print('has hash', maybe_hash)
-
-    elif magic == 0xFF:
-        # look for a partition table
-        data.seek(0x8000, SEEK_SET)
-        ptable = data.read(0x0C00)
-        for entry in map(lambda p: ptable[p:p+32], range(0, len(ptable), 32)):
-            # parse entry
-            pmagic, ptype, psubtype, poff, psz, pname = unpack('<HBBII16s4x', entry)
-            if pmagic == 0x50AA:
-                pname = pname.split(b'\0', 1)[0].decode()
-                ptype = PART_TYPE.get(ptype, f'{ptype}')
-                if ptype == 'app':
-                    psubtype = PART_APP_SUBTYPE.get(psubtype, f'{psubtype}')
-                elif ptype == 'data':
-                    psubtype = PART_DATA_SUBTYPE.get(psubtype, f'{psubtype}')
-                else:
-                    psubtype = f'{psubtype}'
-
-                if ptype == 'app' and psubtype == 'ota_0':
-                    data.seek(poff)
-                    return _process_data(data)
-            else:
-                print(f'[!] Could not find application!')
-                return None
-
-    else:
-        print(f'[!] Could not parse firmware image!')
-        return None
-
-    data.seek(-33, SEEK_END)
-    initial_cksum = data.read(1)[0]
-    print(f'[*] Initial checksum 0x{initial_cksum:02X}')
-
-def _process_file(source):
-    print(f'Source: {source}')
-    source_path = Path(source).absolute()
-    data = _read_as_bytesio(source_path)
-    _process_data(data)
 
 def patch_string(f, key, string, offset, size):
     b = string.encode()
@@ -302,7 +222,10 @@ def patch_binary(source, target, to_patch):
 
 if __name__ == '__main__':
     for source in argv[1:]:
-        _process_file(source)
+        print(f'Source: {source}')
+        source_path = Path(source).absolute()
+        data = _read_as_bytesio(source_path)
+        x = ESPImage(data)
 '''
     if len(argv) > 2:
         source, target = argv[1], argv[2]
