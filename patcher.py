@@ -7,47 +7,207 @@ eprint = partial(print, file=stderr)
 import re
 import io
 import sys
-
-import gzip
-import zlib
+import struct
 
 from pathlib import Path
 from hashlib import sha256
+from struct import unpack, unpack_from
 
-esptool_dir = Path(Path.home(), 'code', 'esptool')
-if esptool_dir.is_dir():
-    sys.path.append(str(esptool_dir.resolve()))
+SEEK_SET = 0
+SEEK_CUR = 1
+SEEK_END = 2
 
-import esptool
-from esptool.loader import ESPLoader
-from esptool.bin_image import ESP8266V2FirmwareImage, LoadFirmwareImage, ImageSegment
-from esptool.targets import CHIP_DEFS, CHIP_LIST, ROM_LIST
+ESP_IMAGE_MAGIC = 0xE9
+ESP_IMAGE_V2_MAGIC = 0xEA
 
-BUILD_OUTPUT = Path('.', 'build_output', 'firmware')
+PART_TYPE = {0x00: 'app', 0x01: 'data'}
+PART_APP_SUBTYPE = {0x00: 'factory', 0x20: 'test'}
+for i in range(0x10, 0x20): PART_APP_SUBTYPE[i] = f'ota_{i-16}'
+PART_DATA_SUBTYPE = {
+    0: 'ota', 1: 'phy', 2: 'nvs', 3: 'coredump', 4: 'nvs_keys', 5: 'efuse',
+    6: 'undefined', 0x81: 'fat', 0x82: 'spiffs', 0x83: 'littlefs',
+}
 
-def compress_with_gzip(data, level=9, **kw):
-    if level > 9:
-        level = 9
-    if level < 1:
-        level = 1
+class ESPImage:
+    def __init__(self, data):
+        self._data = data
+        self._checksum = 0xEF
+        self._parse_header()
 
-    compressor = zlib.compressobj(level=level, wbits=16 + zlib.MAX_WBITS)
-    return compressor.compress(data) + compressor.flush()
+    # wrappers
+    def seek(self, *a, **kw): return self._data.seek(*a, **kw)
+    def tell(self, *a, **kw): return self._data.tell(*a, **kw)
+    def read(self, *a, **kw): return self._data.read(*a, **kw)
 
-# zopfli support is optional.
-try:
-    import zopfli.gzip
-    def compress(data, level=100, **kw):
-        if level < 10:
-            return compress_with_gzip(data, level)
+    def write(self, b, update_checksum=False, /):
+        if update_checksum:
+            n = len(b)
+            a = self.read(n)
+            self.seek(-n, SEEK_CUR)
+            for x, y in zip(a, b):
+                self._checksum ^= x ^ y
 
-        return zopfli.gzip.compress(data, numiterations=level, blocksplittingmax=100, **kw)
+        return self._data.write(b)
 
-except ModuleNotFoundError:
-    eprint('zopfli is not installed.')
-    eprint('Note: only zopfli is supported, not zopflipy.')
-    def compress(data, level=9):
-        return compress_with_gzip(data, level)
+    def unpack(self, fmt):
+        n = struct.calcsize(fmt)
+        return struct.unpack(fmt, self.read(n))
+
+    # parsers
+    def _parse_header(self):
+        data = self._data
+
+        magic = data.read(1)[0]
+
+        if magic in (ESP_IMAGE_MAGIC, ESP_IMAGE_V2_MAGIC):
+            data.seek(-1, SEEK_CUR)
+            return self._parse_ota()
+
+        elif magic == 0xFF:
+            return self._parse_factory()
+
+        else:
+            print(f'[!] Could not parse firmware image!')
+            return None
+
+    def _parse_factory(self):
+        data = self._data
+
+        # look for a partition table
+        data.seek(0x8000, SEEK_SET)
+        ptable = data.read(0x0C00)
+        for entry in map(lambda p: ptable[p:p+32], range(0, len(ptable), 32)):
+            # parse entry
+            pmagic, ptype, psubtype, poff, psz, pname = unpack('<HBBII16s4x', entry)
+            if pmagic == 0x50AA:
+                pname = pname.split(b'\0', 1)[0].decode()
+                ptype = PART_TYPE.get(ptype, f'{ptype}')
+                if ptype == 'app':
+                    psubtype = PART_APP_SUBTYPE.get(psubtype, f'{psubtype}')
+                elif ptype == 'data':
+                    psubtype = PART_DATA_SUBTYPE.get(psubtype, f'{psubtype}')
+                else:
+                    psubtype = f'{psubtype}'
+
+                if ptype == 'app' and psubtype == 'ota_0':
+                    data.seek(poff)
+                    return self._parse_ota(data)
+            else:
+                print(f'[!] Could not find application!')
+                return None
+
+    def _parse_ota(self):
+        data = self._data
+
+        code_begin = data.tell()
+
+        # magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
+        # https://docs.espressif.com/projects/esptool/en/latest/esp8266/advanced-topics/firmware-image-format.html
+        common_header = data.read(8)
+        magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
+
+        # ESP32 firmware images have a larger header, which we detect with heurstics
+        # https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/firmware-image-format.html
+        extended_header = data.read(16)
+        if extended_header[0] == 0:
+            data.seek(-16, SEEK_CUR)
+
+        # walk through the segments
+        for n in range(n_segments):
+            self._parse_segment()
+
+    def _parse_segment(self):
+        data = self._data
+
+        segment_header = data.read(8)
+        mem_offset, segment_size = unpack('<II', segment_header)
+        print(f'[*] segment {n:2} 0x{segment_size:06X}:0x{data.tell():06X} @ 0x{mem_offset:08X}')
+        #segment = data.read(segment_size)
+        #for x in segment: self._checksum ^= x
+
+def _read_as_bytesio(path):
+    if path.suffix == '.gz':
+        import gzip
+        with gzip.open(path, 'rb') as f:
+            return io.BytesIO(f.read())
+    else:
+        with open(path, 'rb') as f:
+            return io.BytesIO(f.read())
+
+def _process_data(data):
+    magic = data.read(1)[0]
+
+    if magic in (ESP_IMAGE_MAGIC, ESP_IMAGE_V2_MAGIC):
+        data.seek(-1, SEEK_CUR)
+        code_begin = data.tell()
+
+        # magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
+        # https://docs.espressif.com/projects/esptool/en/latest/esp8266/advanced-topics/firmware-image-format.html
+        common_header = data.read(8)
+        magic, n_segments, spi_mode, flash_size, entry_point = unpack('<BBBBI', common_header)
+
+        # https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/firmware-image-format.html
+        extended_header = data.read(16)
+        if extended_header[0] == 0:
+            data.seek(-16, SEEK_CUR)
+
+        c = 0xEF
+        # walk through the segments
+        for n in range(n_segments):
+            chunk = data.read(8)
+            mem_offset, segment_size = unpack('<II', chunk)
+            print(f'segment {n:2} 0x{segment_size:06X}:0x{data.tell():06X} @ 0x{mem_offset:08X}')
+            segment = data.read(segment_size)
+            for x in segment:
+                c ^= x
+
+        data.seek(15 - (data.tell() % 16), SEEK_CUR)
+        print('checksum', hex(data.read(1)[0]), hex(c))
+        code_end = data.tell()
+        maybe_hash = data.read(32)
+        if len(maybe_hash) == 32:
+            data.seek(code_begin)
+            check_hash = sha256(data.read(code_end - code_begin)).digest()
+            if check_hash == maybe_hash:
+                print('has hash', maybe_hash)
+
+    elif magic == 0xFF:
+        # look for a partition table
+        data.seek(0x8000, SEEK_SET)
+        ptable = data.read(0x0C00)
+        for entry in map(lambda p: ptable[p:p+32], range(0, len(ptable), 32)):
+            # parse entry
+            pmagic, ptype, psubtype, poff, psz, pname = unpack('<HBBII16s4x', entry)
+            if pmagic == 0x50AA:
+                pname = pname.split(b'\0', 1)[0].decode()
+                ptype = PART_TYPE.get(ptype, f'{ptype}')
+                if ptype == 'app':
+                    psubtype = PART_APP_SUBTYPE.get(psubtype, f'{psubtype}')
+                elif ptype == 'data':
+                    psubtype = PART_DATA_SUBTYPE.get(psubtype, f'{psubtype}')
+                else:
+                    psubtype = f'{psubtype}'
+
+                if ptype == 'app' and psubtype == 'ota_0':
+                    data.seek(poff)
+                    return _process_data(data)
+            else:
+                print(f'[!] Could not find application!')
+                return None
+
+    else:
+        print(f'[!] Could not parse firmware image!')
+        return None
+
+    data.seek(-33, SEEK_END)
+    initial_cksum = data.read(1)[0]
+    print(f'[*] Initial checksum 0x{initial_cksum:02X}')
+
+def _process_file(source):
+    print(f'Source: {source}')
+    source_path = Path(source).absolute()
+    data = _read_as_bytesio(source_path)
+    _process_data(data)
 
 def patch_string(f, key, string, offset, size):
     b = string.encode()
@@ -75,7 +235,7 @@ def patch_binary(source, target, to_patch):
         else:
             data = io.BytesIO(raw)
 
-    data.seek(-33, 2)
+    data.seek(-33, SEEK_END)
     checksum = data.read(1)[0]
     print(f'[*] Initial checksum 0x{checksum:02X}')
 
@@ -115,12 +275,12 @@ def patch_binary(source, target, to_patch):
                     break
 
         print(f'[*] Adjusting checksum to 0x{checksum:02X}...')
-        data.seek(-33, 2)
+        data.seek(-33, SEEK_END)
         data.write(bytes([checksum]))
 
         sha = sha256(data.getvalue()[:-32]).digest()
         # 32 bytes to the end
-        data.seek(-32, 2)
+        data.seek(-32, SEEK_END)
         data.write(sha)
         data.flush()
 
@@ -141,6 +301,9 @@ def patch_binary(source, target, to_patch):
         f.write(buf)
 
 if __name__ == '__main__':
+    for source in argv[1:]:
+        _process_file(source)
+'''
     if len(argv) > 2:
         source, target = argv[1], argv[2]
         to_patch = {}
@@ -168,3 +331,4 @@ if __name__ == '__main__':
                     }
                     #print(source, target, to_patch)
                     patch_binary(source, target, to_patch)
+'''
