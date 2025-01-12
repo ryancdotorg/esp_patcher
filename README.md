@@ -9,5 +9,11 @@ It handles updating the firmware checksum byte and the sha256 hash (if present).
 For ESP32 firmware, it will automatically handle both “OTA” and “factory”
 images. Compression is dealt with transparently.
 
+# Usage
+
+(TODO: write this)
+
+For now, read the source.
+
 # Author
 Ryan Castellucci @ryancdotorg
