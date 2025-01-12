@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: CC0-1.0+ OR 0BSD OR MIT-0
+# Author: Ryan Castellucci https://rya.nc/ https://github.com/ryancorg
 
 from sys import argv, exit, stdin, stdout, stderr
 from functools import partial
