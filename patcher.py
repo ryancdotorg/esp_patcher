@@ -256,7 +256,7 @@ class ESPImage:
         self.seek(offset)
         self.write(b)
 
-def _read_as_bytesio(path):
+def read_as_bytesio(path):
     if path.suffix == '.gz':
         import gzip
         with gzip.open(path, 'rb') as f:
@@ -274,7 +274,7 @@ def patch_binary(source, target, to_patch):
 
     print(f'[+] Patching `{source_path.name}` -> `{target_path.name}`...')
 
-    data = ESPImage(_read_as_bytesio(source_path))
+    data = ESPImage(read_as_bytesio(source_path))
 
     for m in re.finditer(rb'PLACEHOLDER_FOR_(\w+)\s+\0', data.getvalue()):
         key = m.group(1).decode()
@@ -306,7 +306,7 @@ if __name__ == '__main__':
         source = argv[1]
         print(f'Source: {source}')
         source_path = Path(source).absolute()
-        data = _read_as_bytesio(source_path)
+        data = read_as_bytesio(source_path)
         x = ESPImage(data)
     elif len(argv) > 2:
         source, target = argv[1], argv[2]
@@ -315,25 +315,4 @@ if __name__ == '__main__':
             key, _, value = patch.partition('=')
             to_patch[key] = value
 
-        #print(source, target, to_patch)
         patch_binary(source, target, to_patch)
-'''
-    elif len(argv) == 2:
-        with open(argv[1]) as f:
-            for base, module, template in map(lambda l: l.rstrip().split('\t'), f):
-                for x in BUILD_OUTPUT.glob(f'{base}-*ryanc-custom*'):
-                    source_name = x.name
-                    target_name = source_name.replace('-ryanc-custom', f'-{module}')
-                    source = Path(BUILD_OUTPUT, source_name)
-                    target = Path(BUILD_OUTPUT, target_name)
-
-                    if target.is_file() or not source.is_file():
-                        continue
-
-                    to_patch = {
-                        'CODE_IMAGE_STR': module,
-                        'USER_TEMPLATE': template,
-                    }
-                    #print(source, target, to_patch)
-                    patch_binary(source, target, to_patch)
-'''
